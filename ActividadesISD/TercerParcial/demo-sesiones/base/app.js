@@ -5,6 +5,9 @@ const express = require('express');
 const session = require('express-session');
 const MySQLStore = require('express-mysql-session')(session);
 const { crearModeloUsuarios } = require('./modelos/usuarios.modelo');
+const { crearModeloTokens } = require('./modelos/tokens.modelo');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 
 const NOMBRE_COOKIE = 'connect.sid';
 
@@ -23,8 +26,9 @@ const pendiente = (paso) => (req, res) =>
 // pool: la conexión a MySQL (db.js). Los usuarios SIEMPRE se leen de MySQL.
 function crearApp(config, pool) {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '10kb' }));
   const usuarios = crearModeloUsuarios(pool);
+  const tokens = crearModeloTokens(pool);
 
   // Aquí vive lo que el servidor recuerda de cada sesión:
   //  - 'mysql':   en la tabla sessions. Sobrevive a un reinicio y la puedes ver en Workbench.
@@ -98,6 +102,37 @@ function crearApp(config, pool) {
     };
   }
 
+  const intentosFallidos = {};
+  const MAX_INTENTOS = 5;
+  const BLOQUEO_MS = 60 * 1000;
+
+  function estaBloqueado(ip) {
+    const registro = intentosFallidos[ip];
+    if (!registro) return false;
+    if (registro.bloqueadoHasta && Date.now() < registro.bloqueadoHasta) return true;
+    if (registro.bloqueadoHasta && Date.now() >= registro.bloqueadoHasta) delete intentosFallidos[ip];
+    return false;
+  }
+
+  function sumarFallo(ip) {
+    const registro = intentosFallidos[ip] || { fallos: 0, bloqueadoHasta: null };
+    registro.fallos += 1;
+    if (registro.fallos >= MAX_INTENTOS) registro.bloqueadoHasta = Date.now() + BLOQUEO_MS;
+    intentosFallidos[ip] = registro;
+  }
+
+  function validarLogin(cuerpo) {
+    if (!cuerpo || typeof cuerpo !== 'object' || Array.isArray(cuerpo)) return 'Manda un JSON con usuario y contrasena';
+    const { usuario, contrasena } = cuerpo;
+    if (usuario === undefined || contrasena === undefined) return 'Faltan datos: se necesita usuario y contrasena';
+    if (typeof usuario !== 'string' || typeof contrasena !== 'string') return 'usuario y contrasena deben ser texto';
+    if (usuario.trim() === '' || contrasena === '') return 'usuario y contrasena no pueden ir vacíos';
+    if (usuario.length > 30) return 'El usuario no puede tener más de 30 caracteres';
+    if (contrasena.length > 100) return 'La contraseña no puede tener más de 100 caracteres';
+    if (!/^[a-zA-Z0-9._-]+$/.test(usuario.trim())) return 'El usuario solo puede tener letras, números, punto, guion o guion bajo';
+    return null;
+  }
+
   // ---------- Rutas ----------
 
   app.get('/api/config', (req, res) => res.json(config));
@@ -113,10 +148,19 @@ function crearApp(config, pool) {
   // Paso 2 (en clase): iniciar sesión. Paso 7 (en clase): regenerar el id al entrar.
   app.post('/api/login', async (req, res, next) => {
     try {
-      const { usuario, contrasena } = req.body || {};
-      const encontrado = await usuarios.verificar(usuario, contrasena);
+      if (estaBloqueado(req.ip)) {
+        return res.status(429).json({ error: '429 · Demasiados intentos fallidos, espera un minuto' });
+      }
+      const problema = validarLogin(req.body);
+      if (problema) return res.status(400).json({ error: `400 · ${problema}` });
+
+      const encontrado = await usuarios.verificar(req.body.usuario.trim(), req.body.contrasena);
       // Mismo mensaje si el usuario no existe o si la contraseña está mal.
-      if (!encontrado) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+      if (!encontrado) {
+        sumarFallo(req.ip);
+        return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+      }
+      delete intentosFallidos[req.ip];
 
       const sesionAntes = idDeLaCookie(req) === req.sessionID ? idCorto(req.sessionID) : null;
       const guardar = () => {
@@ -186,11 +230,131 @@ function crearApp(config, pool) {
     }
   });
 
+  const SECRETO_JWT = process.env.JWT_SECRET || 'secreto-jwt-solo-para-la-demo';
+
+  function firmarToken(usuario) {
+    return jwt.sign(
+      { sub: String(usuario.id), usuario: usuario.usuario, nombre: usuario.nombre, rol: usuario.rol },
+      SECRETO_JWT,
+      { algorithm: 'HS256', expiresIn: config.jwtExpiraSeg, jwtid: crypto.randomUUID() }
+    );
+  }
+
+  async function requiereJWT(req, res, next) {
+    const encabezado = req.headers.authorization || '';
+    if (!encabezado.startsWith('Bearer ')) {
+      return res.status(401).json({ error: '401 · Falta el token (Authorization: Bearer ...)' });
+    }
+    const token = encabezado.slice('Bearer '.length).trim();
+
+    let datos;
+    try {
+      datos = jwt.verify(token, SECRETO_JWT, { algorithms: ['HS256'] });
+    } catch (error) {
+      if (error.name === 'TokenExpiredError') {
+        return res.status(401).json({ error: '401 · Token expirado, renuévalo o vuelve a iniciar sesión' });
+      }
+      return res.status(401).json({ error: '401 · Token inválido' });
+    }
+
+    try {
+      if (config.jwtRevocar && (await tokens.estaRevocado(datos.jti))) {
+        return res.status(401).json({ error: '401 · Token revocado, ya se cerró la sesión' });
+      }
+    } catch (error) {
+      return next(error);
+    }
+
+    req.jwt = datos;
+    return next();
+  }
+
+  function requiereRolJWT(rol) {
+    return (req, res, next) => {
+      if (req.jwt.rol === rol) return next();
+      return res.status(403).json({ error: `403 · Eres ${req.jwt.usuario}, pero esta ruta es solo para ${rol}` });
+    };
+  }
+
+  app.post('/api/jwt/login', async (req, res, next) => {
+    try {
+      if (estaBloqueado(req.ip)) {
+        return res.status(429).json({ error: '429 · Demasiados intentos fallidos, espera un minuto' });
+      }
+      const problema = validarLogin(req.body);
+      if (problema) return res.status(400).json({ error: `400 · ${problema}` });
+
+      const datos = await usuarios.verificar(req.body.usuario.trim(), req.body.contrasena);
+      if (!datos) {
+        sumarFallo(req.ip);
+        return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+      }
+      delete intentosFallidos[req.ip];
+
+      res.json({ token: firmarToken(datos), usuario: datos, expiraEnSegundos: config.jwtExpiraSeg });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/api/jwt/sesion', requiereJWT, (req, res) => {
+    res.json({
+      usuario: { id: req.jwt.sub, usuario: req.jwt.usuario, nombre: req.jwt.nombre, rol: req.jwt.rol },
+      jti: req.jwt.jti,
+      emitido: new Date(req.jwt.iat * 1000),
+      expira: new Date(req.jwt.exp * 1000),
+      expiraEnSegundos: Math.max(0, req.jwt.exp - Math.floor(Date.now() / 1000)),
+    });
+  });
+
+  app.get('/api/jwt/perfil', requiereJWT, (req, res) => {
+    res.json({
+      mensaje: `Hola, ${req.jwt.nombre}`,
+      rol: req.jwt.rol,
+      expiraEnSegundos: Math.max(0, req.jwt.exp - Math.floor(Date.now() / 1000)),
+    });
+  });
+
+  app.post('/api/jwt/refresh', requiereJWT, (req, res) => {
+    const { sub, usuario, nombre, rol } = req.jwt;
+    res.json({ token: firmarToken({ id: sub, usuario, nombre, rol }), expiraEnSegundos: config.jwtExpiraSeg });
+  });
+
+  app.get('/api/jwt/reporte', requiereJWT, requiereRolJWT('admin'), (req, res) => {
+    res.json({ reporte: 'Talleres: 3 · Inscritos: 57 · Cupo libre: 18' });
+  });
+
+  app.post('/api/jwt/logout', requiereJWT, async (req, res, next) => {
+    try {
+      if (config.jwtRevocar) {
+        await tokens.revocar(req.jwt.jti, req.jwt.usuario, req.jwt.exp);
+        return res.json({ mensaje: 'Token revocado: el servidor lo anotó en la lista negra', revocado: true });
+      }
+      res.json({ mensaje: 'El servidor no guarda nada, solo se borra el token del navegador (sigue sirviendo hasta que venza)', revocado: false });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/api/diagnostico/tokens', async (req, res, next) => {
+    try {
+      res.json({ revocar: config.jwtRevocar, tokens: await tokens.listar() });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.use(express.static(path.join(__dirname, 'public')));
 
   app.use('/api', (req, res) => res.status(404).json({ error: 'Ruta no encontrada' }));
   // eslint-disable-next-line no-unused-vars
   app.use((error, req, res, next) => {
+    if (error.type === 'entity.parse.failed') {
+      return res.status(400).json({ error: '400 · El JSON está mal escrito' });
+    }
+    if (error.type === 'entity.too.large') {
+      return res.status(413).json({ error: '413 · Lo que mandaste es demasiado grande' });
+    }
     console.error(error);
     res.status(500).json({ error: 'Error del servidor' });
   });
