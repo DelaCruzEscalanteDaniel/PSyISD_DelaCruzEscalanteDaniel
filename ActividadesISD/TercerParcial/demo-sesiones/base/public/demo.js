@@ -1,7 +1,8 @@
 const $ = (id) => document.getElementById(id);
 
-async function llamar(metodo, url, cuerpo) {
+async function llamar(metodo, url, cuerpo, token) {
   const opciones = { method: metodo, headers: {} };
+  if (token) opciones.headers.Authorization = `Bearer ${token}`;
 
   if (cuerpo !== undefined) {
     opciones.headers['Content-Type'] = 'application/json';
@@ -26,7 +27,7 @@ function claseDelCodigo(status) {
   return 'codigo error';
 }
 
-function anotar(metodo, url, status, datos) {
+function anotar(metodo, url, status, datos, idLista = 'bitacora') {
   const li = document.createElement('li');
 
   const codigo = document.createElement('span');
@@ -40,7 +41,7 @@ function anotar(metodo, url, status, datos) {
   json.textContent = JSON.stringify(datos, null, 2);
 
   li.append(codigo, peticion, json);
-  $('bitacora').prepend(li);
+  $(idLista).prepend(li);
 }
 
 async function refrescarEstado() {
@@ -137,10 +138,116 @@ for (const boton of document.querySelectorAll('button[data-url]')) {
 $('btn-refrescar').addEventListener('click', refrescarTodo);
 $('btn-sesiones').addEventListener('click', refrescarSesiones);
 
+let tokenJWT = sessionStorage.getItem('tokenJWT');
+
+function guardarToken(token) {
+  tokenJWT = token;
+  if (token) sessionStorage.setItem('tokenJWT', token);
+  else sessionStorage.removeItem('tokenJWT');
+}
+
+function leerPayload(token) {
+  try {
+    const parte = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const bytes = Uint8Array.from(atob(parte), (ch) => ch.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
+async function refrescarEstadoJWT() {
+  const estado = $('estado-jwt');
+  if (!tokenJWT) {
+    estado.textContent = 'Sin token';
+    estado.className = 'estado sin-sesion';
+    $('jwt-token').textContent = '(sin token)';
+    $('jwt-payload').textContent = '(sin token)';
+    return;
+  }
+  $('jwt-token').textContent = tokenJWT;
+  $('jwt-payload').textContent = JSON.stringify(leerPayload(tokenJWT), null, 2);
+
+  const { status, datos } = await llamar('GET', '/api/jwt/sesion', undefined, tokenJWT);
+  if (status === 200 && datos && datos.usuario) {
+    const u = datos.usuario;
+    estado.textContent = `Con token: ${u.nombre} (${u.rol}) · token ${datos.jti.slice(0, 8)}… · vence en ${datos.expiraEnSegundos} s`;
+    estado.className = 'estado con-sesion';
+  } else {
+    estado.textContent = `Token NO válido: ${datos ? datos.error : status}`;
+    estado.className = 'estado sin-sesion';
+  }
+}
+
+async function refrescarTokens() {
+  const { status, datos } = await llamar('GET', '/api/diagnostico/tokens');
+  const cuerpo = $('tabla-tokens');
+  cuerpo.replaceChildren();
+  if (status !== 200 || !datos) {
+    $('jwt-revocar').textContent = `No se pudo leer la lista negra (código ${status})`;
+    cuerpo.append(filaVacia('(no se pudo leer)'));
+    return;
+  }
+  $('jwt-revocar').textContent = datos.revocar
+    ? 'jwtRevocar = true: al hacer logout el token se anota en MySQL (tabla tokens_revocados)'
+    : 'jwtRevocar = false: el servidor no guarda nada, el token sirve hasta que venza';
+
+  if (datos.tokens.length === 0) {
+    cuerpo.append(filaVacia('(sin tokens revocados)'));
+    return;
+  }
+  const mio = tokenJWT ? (leerPayload(tokenJWT) || {}).jti : null;
+  for (const tk of datos.tokens) {
+    const fila = document.createElement('tr');
+    if (mio === tk.jti) fila.className = 'tuya';
+    fila.append(
+      celda(`${tk.jti.slice(0, 8)}…`),
+      celda(tk.usuario),
+      celda(new Date(tk.expira).toLocaleTimeString()),
+      celda(new Date(tk.revocado_en).toLocaleTimeString())
+    );
+    cuerpo.append(fila);
+  }
+}
+
+async function refrescarJWT() {
+  await refrescarEstadoJWT();
+  await refrescarTokens();
+}
+
+for (const boton of document.querySelectorAll('button[data-jwt]')) {
+  boton.addEventListener('click', async () => {
+    const accion = boton.dataset.jwt;
+
+    if (accion === 'borrar') {
+      guardarToken(null);
+      anotar('--', 'sessionStorage', '--', { mensaje: 'Token borrado del navegador (el servidor no se entera)' }, 'bitacora-jwt');
+      await refrescarJWT();
+      return;
+    }
+
+    if (accion === 'login') {
+      const cuerpo = { usuario: $('usuario').value, contrasena: $('contrasena').value };
+      const { status, datos } = await llamar('POST', '/api/jwt/login', cuerpo);
+      anotar('POST', '/api/jwt/login', status, datos, 'bitacora-jwt');
+      if (status === 200) guardarToken(datos.token);
+    } else {
+      const [metodo, url] = accion.split(' ');
+      const { status, datos } = await llamar(metodo, url, undefined, tokenJWT);
+      anotar(metodo, url, status, datos, 'bitacora-jwt');
+      if (url === '/api/jwt/refresh' && status === 200) guardarToken(datos.token);
+    }
+    await refrescarJWT();
+  });
+}
+
+$('btn-tokens').addEventListener('click', refrescarTokens);
+
 async function iniciar() {
   const { datos } = await llamar('GET', '/api/config');
   $('config').textContent = JSON.stringify(datos, null, 2);
   await refrescarTodo();
+  await refrescarJWT();
 }
 
 iniciar();
